@@ -18,6 +18,25 @@ const io = new Server(server, {
 const rooms = {};
 const RANK_ORDER = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
 
+const MAX_CHAT_MESSAGES = 200;
+const MAX_CHAT_LENGTH = 300;
+
+function pushChatMessage(room, { playerId, playerName, text }) {
+  const message = {
+    id: uuidv4(),
+    playerId,
+    playerName,
+    text,
+    timestamp: Date.now(),
+  };
+  room.chatMessages = room.chatMessages || [];
+  room.chatMessages.push(message);
+  if (room.chatMessages.length > MAX_CHAT_MESSAGES) {
+    room.chatMessages = room.chatMessages.slice(-MAX_CHAT_MESSAGES);
+  }
+  return message;
+}
+
 function rankValue(rank) { return RANK_ORDER.indexOf(rank); }
 
 function generateRoomCode() {
@@ -234,12 +253,14 @@ io.on('connection', (socket) => {
       teamNames: { 1: 'Team Blue', 2: 'Team Red' },
       roundHistory: [], // [{ roundNum, winner, bug, score: {1:{tens,piles}, 2:{tens,piles}} }]
       totalScore: { 1: 0, 2: 0 }, // points won per team across all rounds
+      chatMessages: [],
       game: null
     };
     socket.join(roomCode);
     socket.data.playerId = playerId;
     socket.data.roomCode = roomCode;
     cb({ success: true, playerId, roomCode });
+    socket.emit('chatHistory', rooms[roomCode].chatMessages);
     broadcastRoom(rooms[roomCode]);
   });
 
@@ -254,6 +275,7 @@ io.on('connection', (socket) => {
     socket.data.playerId = playerId;
     socket.data.roomCode = roomCode;
     cb({ success: true, playerId, roomCode });
+    socket.emit('chatHistory', room.chatMessages || []);
     broadcastRoom(room);
   });
 
@@ -265,6 +287,7 @@ io.on('connection', (socket) => {
     socket.data.playerId = playerId;
     socket.data.roomCode = roomCode;
     cb({ success: true });
+    socket.emit('chatHistory', room.chatMessages || []);
     broadcastRoom(room);
     if (['hukun', 'playing', 'ended', 'interrupted'].includes(room.status)) {
       socket.emit('gameState', buildGameStateForPlayer(room, playerId));
@@ -821,6 +844,21 @@ io.on('connection', (socket) => {
 
     broadcastGameState(room);
     cb?.({ success: true, ended: endCheck.ended });
+  });
+
+  socket.on('sendChatMessage', ({ text }, cb) => {
+    const { playerId, roomCode } = socket.data;
+    const room = rooms[roomCode];
+    if (!room) return cb?.({ success: false, error: 'Room not found' });
+    const player = room.players[playerId];
+    if (!player) return cb?.({ success: false, error: 'Player not found' });
+
+    const trimmed = (text || '').trim().slice(0, MAX_CHAT_LENGTH);
+    if (!trimmed) return cb?.({ success: false, error: 'Message is empty' });
+
+    const message = pushChatMessage(room, { playerId, playerName: player.name, text: trimmed });
+    io.to(roomCode).emit('chatMessage', message);
+    cb?.({ success: true });
   });
 
   socket.on('disconnect', () => {
