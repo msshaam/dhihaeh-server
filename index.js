@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const { dealCards, sortHand } = require('./gameLogic');
+const { getVoteOutcome } = require('./disconnectVoteLogic');
 
 const app = express();
 app.use(cors());
@@ -125,6 +126,101 @@ function broadcastGameState(room) {
   }
 }
 
+// ── Room management helpers ─────────────────────────────────────
+
+function assignOwnerIfNeeded(room, preferredPlayerId = null) {
+  const players = Object.values(room.players);
+  if (players.length === 0) { room.ownerId = null; return; }
+  const preferred = preferredPlayerId && room.players[preferredPlayerId];
+  if (preferred?.socketId) { room.ownerId = preferredPlayerId; return; }
+  const currentOwner = room.players[room.ownerId];
+  if (currentOwner?.socketId) return; // current owner still connected
+  const connectedPlayer = players.find(p => p.socketId);
+  room.ownerId = (connectedPlayer || players[0]).id;
+}
+
+function buildScoreSnapshot(room) {
+  if (!room.game) return null;
+  return {
+    1: { tens: room.game.score[1].tens, piles: room.game.score[1].piles },
+    2: { tens: room.game.score[2].tens, piles: room.game.score[2].piles }
+  };
+}
+
+// Dhihaeh always needs exactly 4 fixed seats — there's no valid way to keep
+// playing with 3. Any disruption (leave, host-end, vote-kick) immediately
+// interrupts the current game rather than trying to continue.
+function enterInterruptedState(room, reason) {
+  room.status = 'interrupted';
+  room.interruptionReason = reason;
+  room.scoreSnapshot = buildScoreSnapshot(room);
+  room.disconnectVote = null;
+}
+
+function getDisconnectVoteState(room, requestingPlayerId) {
+  const now = Date.now();
+  const eligibleDisconnected = Object.values(room.players)
+    .filter(p => !p.socketId && p.disconnectedAt && now - p.disconnectedAt >= 5 * 60 * 1000)
+    .map(p => ({ playerId: p.id, name: p.name }));
+
+  if ((room.status !== 'hukun' && room.status !== 'playing') || eligibleDisconnected.length === 0) return null;
+  if (room.disconnectVote?.cooldownUntil && room.disconnectVote.cooldownUntil > now) return null;
+
+  const connected = Object.values(room.players).filter(p => p.socketId);
+
+  // Only one other player still around — no point voting against themselves
+  if (connected.length <= 1) {
+    return { mode: 'soloEnd', eligible: true, disconnectedPlayers: eligibleDisconnected };
+  }
+
+  const votes = room.disconnectVote?.votes || {};
+  const voteOutcome = getVoteOutcome({
+    votes,
+    connectedPlayerIds: connected.map(p => p.id),
+  });
+
+  return {
+    mode: 'vote',
+    eligible: true,
+    disconnectedPlayers: eligibleDisconnected,
+    myVote: votes[requestingPlayerId] || null,
+    yesVotes: voteOutcome.yesVotes,
+    noVotes: voteOutcome.noVotes,
+    votedCount: voteOutcome.votedCount,
+    totalVoters: voteOutcome.totalVoters,
+    majority: voteOutcome.majority,
+  };
+}
+
+function removeLongDisconnected(room) {
+  const now = Date.now();
+  Object.values(room.players).forEach(p => {
+    if (!p.socketId && p.disconnectedAt && now - p.disconnectedAt >= 5 * 60 * 1000) {
+      delete room.players[p.id];
+    }
+  });
+  assignOwnerIfNeeded(room);
+}
+
+function scheduleDisconnectVoteCheck(roomCode, playerId) {
+  setTimeout(() => {
+    const room = rooms[roomCode];
+    if (!room || (room.status !== 'hukun' && room.status !== 'playing')) return;
+    const player = room.players[playerId];
+    if (!player || player.socketId || !player.disconnectedAt) return;
+    const voteState = getDisconnectVoteState(room, playerId);
+    if (voteState?.eligible) broadcastGameState(room);
+  }, 5 * 60 * 1000);
+}
+
+function scheduleDisconnectVoteCooldown(roomCode) {
+  setTimeout(() => {
+    const room = rooms[roomCode];
+    if (!room || (room.status !== 'hukun' && room.status !== 'playing')) return;
+    broadcastGameState(room);
+  }, 5 * 60 * 1000);
+}
+
 // ── Socket handlers ───────────────────────────────────────────
 
 io.on('connection', (socket) => {
@@ -170,7 +266,7 @@ io.on('connection', (socket) => {
     socket.data.roomCode = roomCode;
     cb({ success: true });
     broadcastRoom(room);
-    if (room.status === 'hukun' || room.status === 'playing') {
+    if (['hukun', 'playing', 'ended', 'interrupted'].includes(room.status)) {
       socket.emit('gameState', buildGameStateForPlayer(room, playerId));
     }
   });
@@ -204,6 +300,128 @@ io.on('connection', (socket) => {
     room.players[playerId].team = null;
     room.players[playerId].seatIndex = null;
     broadcastRoom(room);
+  });
+
+  // Player explicitly leaves the room — different from a disconnect, which
+  // keeps their seat reserved for a few minutes in case they reconnect.
+  socket.on('leaveRoom', (cb) => {
+    const { playerId, roomCode } = socket.data;
+    const room = rooms[roomCode];
+    if (!room || !room.players[playerId]) return cb?.({ success: true, closed: true });
+
+    const player = room.players[playerId];
+    const wasOwner = playerId === room.ownerId;
+    const activeGame = room.status === 'hukun' || room.status === 'playing';
+
+    delete room.players[playerId];
+    socket.leave(roomCode);
+
+    if (Object.keys(room.players).length === 0) {
+      delete rooms[roomCode];
+      return cb?.({ success: true, closed: true });
+    }
+
+    if (wasOwner) assignOwnerIfNeeded(room);
+
+    if (activeGame) {
+      // Dhihaeh needs exactly 4 fixed seats — can't continue with 3
+      enterInterruptedState(room, `${player.name} left the game.`);
+      broadcastGameState(room);
+    }
+
+    broadcastRoom(room);
+    cb?.({ success: true, left: true });
+  });
+
+  // Host can force-end the game during hukun selection or active play
+  socket.on('endCurrentGame', (cb) => {
+    const { playerId, roomCode } = socket.data;
+    const room = rooms[roomCode];
+    if (!room) return cb?.({ success: false, error: 'Room not found' });
+    if (room.ownerId !== playerId) return cb?.({ success: false, error: 'Only the host can end the game' });
+    if (room.status !== 'hukun' && room.status !== 'playing') {
+      return cb?.({ success: false, error: 'Game is not in progress' });
+    }
+    const hostName = room.players[playerId]?.name || 'Host';
+    enterInterruptedState(room, `${hostName} ended the game.`);
+    broadcastGameState(room);
+    broadcastRoom(room);
+    cb?.({ success: true });
+  });
+
+  // Vote to remove a long-disconnected player and end the current game
+  socket.on('voteEndGame', ({ vote }, cb) => {
+    const { playerId, roomCode } = socket.data;
+    const room = rooms[roomCode];
+    if (!room) return cb?.({ success: false, error: 'Room not found' });
+    const player = room.players[playerId];
+    if (!player) return cb?.({ success: false, error: 'Player not found' });
+    if (room.status !== 'hukun' && room.status !== 'playing') {
+      return cb?.({ success: false, error: 'Game is not in progress' });
+    }
+
+    const voteState = getDisconnectVoteState(room, playerId);
+    if (!voteState?.eligible) return cb?.({ success: false, error: 'No disconnect vote is available yet' });
+
+    if (voteState.mode === 'soloEnd') {
+      removeLongDisconnected(room);
+      enterInterruptedState(room, 'Disconnected player was removed.');
+      broadcastGameState(room);
+      broadcastRoom(room);
+      return cb?.({ success: true, ended: true });
+    }
+
+    if (vote !== 'yes' && vote !== 'no') return cb?.({ success: false, error: 'Vote must be yes or no' });
+    if (!room.disconnectVote) room.disconnectVote = { votes: {} };
+    if (room.disconnectVote.cooldownUntil && room.disconnectVote.cooldownUntil > Date.now()) {
+      return cb?.({ success: false, error: 'Disconnect vote is waiting before it can be shown again' });
+    }
+    room.disconnectVote.votes[playerId] = vote;
+
+    const connected = Object.values(room.players).filter(p => p.socketId);
+    const voteOutcome = getVoteOutcome({
+      votes: room.disconnectVote.votes,
+      connectedPlayerIds: connected.map(p => p.id),
+    });
+
+    if (voteOutcome.result === 'end') {
+      removeLongDisconnected(room);
+      enterInterruptedState(room, 'Disconnected player(s) were removed.');
+      broadcastGameState(room);
+      broadcastRoom(room);
+      return cb?.({ success: true, ended: true });
+    }
+
+    if (voteOutcome.result === 'wait') {
+      room.disconnectVote = { votes: {}, cooldownUntil: Date.now() + 5 * 60 * 1000 };
+      scheduleDisconnectVoteCooldown(roomCode);
+      broadcastGameState(room);
+      return cb?.({ success: true, waiting: true });
+    }
+
+    broadcastGameState(room);
+    return cb?.({ success: true });
+  });
+
+  // Host takes everyone back to team select after a game was interrupted
+  socket.on('backToTeamSelect', (cb) => {
+    const { playerId, roomCode } = socket.data;
+    const room = rooms[roomCode];
+    if (!room) return cb?.({ success: false, error: 'Room not found' });
+    if (room.ownerId !== playerId) return cb?.({ success: false, error: 'Only the host can do this' });
+    if (room.status !== 'interrupted') return cb?.({ success: false, error: 'Game is not interrupted' });
+
+    room.status = 'waiting';
+    room.game = null;
+    room.interruptionReason = null;
+    room.scoreSnapshot = null;
+    room.roundHistory = [];
+    room.totalScore = { 1: 0, 2: 0 };
+    room.disconnectVote = null;
+    Object.values(room.players).forEach(p => { p.team = null; p.seatIndex = null; });
+
+    broadcastRoom(room);
+    cb?.({ success: true });
   });
 
   socket.on('startGame', (cb) => {
@@ -630,7 +848,20 @@ io.on('connection', (socket) => {
     const { playerId, roomCode } = socket.data;
     if (!roomCode || !rooms[roomCode]) return;
     const room = rooms[roomCode];
-    if (room.players[playerId]) room.players[playerId].socketId = null;
+    const player = room.players[playerId];
+    if (!player) return;
+
+    player.socketId = null;
+    player.disconnectedAt = Date.now();
+
+    const wasOwner = playerId === room.ownerId;
+    if (wasOwner) assignOwnerIfNeeded(room);
+    room.disconnectVote = null;
+
+    if (room.status === 'hukun' || room.status === 'playing') {
+      scheduleDisconnectVoteCheck(roomCode, playerId);
+      broadcastGameState(room);
+    }
     broadcastRoom(room);
   });
 });
@@ -648,7 +879,7 @@ function buildGameStateForPlayer(room, playerId) {
 
   const players = seatOrder.map((pid, idx) => ({
     id: pid,
-    name: room.players[pid]?.name,
+    name: room.players[pid]?.name || 'Player left',
     seat: idx + 1,
     team: room.players[pid]?.team,
     isOwner: pid === room.ownerId,
@@ -682,7 +913,10 @@ function buildGameStateForPlayer(room, playerId) {
     totalScore: room.totalScore,
     hukun5: room.status === 'hukun'
       ? (isP2 ? game.hukun5 : game.hukun5.map(() => ({ id: 'hidden', rank: '?', suit: '?' })))
-      : null
+      : null,
+    interruptionReason: room.interruptionReason || null,
+    scoreSnapshot: room.scoreSnapshot || null,
+    disconnectVote: getDisconnectVoteState(room, playerId)
   };
 }
 
