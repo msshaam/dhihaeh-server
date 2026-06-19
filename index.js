@@ -403,27 +403,6 @@ io.on('connection', (socket) => {
     return cb?.({ success: true });
   });
 
-  // Host takes everyone back to team select after a game was interrupted
-  socket.on('backToTeamSelect', (cb) => {
-    const { playerId, roomCode } = socket.data;
-    const room = rooms[roomCode];
-    if (!room) return cb?.({ success: false, error: 'Room not found' });
-    if (room.ownerId !== playerId) return cb?.({ success: false, error: 'Only the host can do this' });
-    if (room.status !== 'interrupted') return cb?.({ success: false, error: 'Game is not interrupted' });
-
-    room.status = 'waiting';
-    room.game = null;
-    room.interruptionReason = null;
-    room.scoreSnapshot = null;
-    room.roundHistory = [];
-    room.totalScore = { 1: 0, 2: 0 };
-    room.disconnectVote = null;
-    Object.values(room.players).forEach(p => { p.team = null; p.seatIndex = null; });
-
-    broadcastRoom(room);
-    cb?.({ success: true });
-  });
-
   socket.on('startGame', (cb) => {
     const { playerId, roomCode } = socket.data;
     const room = rooms[roomCode];
